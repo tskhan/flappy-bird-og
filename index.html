@@ -1,0 +1,363 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Flappy Bird OG</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #222; display: grid; place-items: center; }
+  canvas { height: 100vh; max-width: 100vw; aspect-ratio: 288 / 512; touch-action: none; image-rendering: pixelated; }
+</style>
+</head>
+<body>
+<canvas id="c" width="288" height="512"></canvas>
+<script>
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const W = cv.width, H = cv.height, GROUND = 112, GAP = 110, PIPE_W = 52, CAP_H = 26, SPEED = 2;
+const GRAVITY = 0.45, FLAP = -7, BIRD_X = 70, R = 12;
+const SLOW = 0.4, SLOW_DRAIN = 180, SLOW_RECHARGE = 600; // slow-mo: time scale, frames to empty / refill
+const OUTLINE = '#543847', FONT = '"Arial Black", "Arial Bold", sans-serif';
+const GY = H - GROUND;
+
+let bird, pipes, score, state, frame, newEntry, cur = 0;
+let scroll = 0, spawn = 0, energy = 1, slowHeld = false, slowLocked = false, slowOn = false;
+let ts = 1, slowTouch = false, slowId = null; // ts: current time scale, eased toward target
+const downIds = new Set(); // active pointers; a 2nd finger held during play = slow-mo
+const initials = ['A', 'A', 'A'];
+const SCORE_KEY = 'flappyScores', MONO = '"Courier New", monospace';
+const BTN = { x: W / 2 - 45, y: 350, w: 90, h: 38 };
+
+// ---- high scores (persisted in localStorage, top 10, sorted high to low) ----
+function loadScores() {
+  try {
+    const a = JSON.parse(localStorage.getItem(SCORE_KEY));
+    return (Array.isArray(a) ? a : [])
+      .filter(s => s && /^[A-Z]{3}$/.test(s.name) && Number.isFinite(s.score))
+      .sort((a, b) => b.score - a.score).slice(0, 10);
+  } catch { return []; }
+}
+let scores = loadScores();
+const qualifies = s => s > 0 && (scores.length < 10 || s > scores[9].score);
+
+function addScore(name, s) {
+  newEntry = { name, score: s };
+  scores = [...scores, newEntry].sort((a, b) => b.score - a.score).slice(0, 10);
+  try { localStorage.setItem(SCORE_KEY, JSON.stringify(scores)); } catch {}
+}
+
+const stepLetter = (c, d) => String.fromCharCode((c.charCodeAt(0) - 65 + d + 26) % 26 + 65);
+
+function confirmEntry() {
+  addScore(initials.join(''), score);
+  sfx(988, 1319, 0.15);
+  state = 'board'; frame = 0;
+}
+
+function entryKey(e) {
+  const k = e.key;
+  if (/^[a-z]$/i.test(k)) { initials[cur] = k.toUpperCase(); cur = Math.min(cur + 1, 2); }
+  else if (k === 'Backspace' || k === 'ArrowLeft') cur = Math.max(cur - 1, 0);
+  else if (k === 'ArrowRight') cur = Math.min(cur + 1, 2);
+  else if (k === 'ArrowUp') initials[cur] = stepLetter(initials[cur], 1);
+  else if (k === 'ArrowDown') initials[cur] = stepLetter(initials[cur], -1);
+  else if (k === 'Enter') confirmEntry();
+  else return;
+  e.preventDefault();
+}
+
+function entryTap(e) {
+  const r = cv.getBoundingClientRect();
+  const x = (e.clientX - r.left) * W / r.width, y = (e.clientY - r.top) * H / r.height;
+  if (x >= BTN.x && x <= BTN.x + BTN.w && y >= BTN.y && y <= BTN.y + BTN.h) return confirmEntry();
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(x - (W / 2 + (i - 1) * 60)) < 30 && y > 250 && y < 335) {
+      cur = i; initials[i] = stepLetter(initials[i], 1);
+    }
+  }
+}
+
+// ---- sound (WebAudio synth, no files) ----
+let actx;
+function sfx(f1, f2, dur, type = 'square', vol = 0.08, delay = 0) {
+  try {
+    actx ??= new AudioContext();
+    if (actx.state === 'suspended') actx.resume();
+    const t = actx.currentTime + delay, o = actx.createOscillator(), g = actx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t);
+    o.frequency.exponentialRampToValueAtTime(f2, t + dur);
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    o.connect(g).connect(actx.destination);
+    o.start(t); o.stop(t + dur);
+  } catch {}
+}
+
+// drifting sky clouds: x, y, scale
+const clouds = [[40, 70, 1], [180, 140, 0.7], [260, 40, 0.5], [110, 220, 0.8]].map(([x, y, s]) => ({ x, y, s }));
+
+function reset() {
+  bird = { y: H / 2 - 40, v: 0 };
+  pipes = [];
+  score = 0;
+  frame = 0;
+  newEntry = null;
+  spawn = 0; energy = 1; ts = 1; slowLocked = false; slowOn = false;
+  state = 'ready'; // ready | play | dead | entry | board
+}
+
+function flap() {
+  if (state === 'board') { if (frame > 30) reset(); return; }
+  if (state === 'dead' || state === 'entry') return;
+  if (state === 'ready') state = 'play';
+  bird.v = FLAP;
+  sfx(450, 900, 0.1);
+}
+
+function update() {
+  frame++;
+  for (const c of clouds) { c.x -= c.s * 0.3; if (c.x < -50) c.x = W + 50; }
+  if (state === 'ready') { scroll += SPEED; bird.y =H / 2 - 40 + Math.sin(frame / 8) * 6; return; }
+  if (state !== 'play') {
+    bird.v += GRAVITY; bird.y = Math.min(bird.y + bird.v, GY - R);
+    if (state === 'dead' && frame > 40) {
+      cur = 0;
+      state = qualifies(score) ? 'entry' : 'board';
+      frame = 0;
+    }
+    return;
+  }
+  // slow-mo: everything (bird, pipes, ground) runs on the same scaled clock, so the arc is unchanged, just slower
+  if (energy <= 0) slowLocked = true;
+  else if (energy > 0.25) slowLocked = false;
+  const slow = (slowHeld || slowTouch) && !slowLocked;
+  if (slow && !slowOn) sfx(300, 90, 0.2, 'sine', 0.1);
+  slowOn = slow;
+  energy = slow ? Math.max(0, energy - 1 / SLOW_DRAIN) : Math.min(1, energy + 1 / SLOW_RECHARGE);
+  ts += ((slow ? SLOW : 1) - ts) * (slow ? 0.2 : 0.05); // quick ease in, slow ease out
+  const dt = ts;
+  scroll += SPEED * dt;
+
+  bird.v += GRAVITY * dt;
+  bird.y += bird.v * dt;
+
+  spawn -= dt;
+  if (spawn <= 0) {
+    spawn = 90;
+    pipes.push({ x: W, top: 50 + Math.random() * (GY - GAP - 100), scored: false });
+  }
+  for (const p of pipes) {
+    p.x -= SPEED * dt;
+    if (!p.scored && p.x + PIPE_W < BIRD_X - R) { p.scored = true; score++; sfx(988, 988, 0.07, 'square', 0.07); sfx(1319, 1319, 0.12, 'square', 0.07, 0.07); }
+    const hitX = BIRD_X + R > p.x && BIRD_X - R < p.x + PIPE_W;
+    if (hitX && (bird.y - R < p.top || bird.y + R > p.top + GAP)) die();
+  }
+  pipes = pipes.filter(p => p.x > -PIPE_W);
+  if (bird.y + R > GY || bird.y - R < 0) die();
+}
+
+function die() {
+  if (state === 'dead') return;
+  state = 'dead'; frame = 0;
+  sfx(220, 50, 0.25, 'sawtooth', 0.15);
+  sfx(500, 120, 0.4, 'triangle', 0.1, 0.2);
+}
+
+// ---- drawing ----
+const BUILDINGS = [[0,50],[34,80],[70,45],[100,95],[140,60],[176,85],[212,50],[244,75]]; // [x, height]
+
+function drawBackground() {
+  ctx.fillStyle = '#4ec0ca'; ctx.fillRect(0, 0, W, H);
+  // sky clouds
+  ctx.fillStyle = '#e4fbd6';
+  for (const { x, y, s } of clouds) {
+    for (const [dx, dy, r] of [[0, 0, 16], [18, -6, 20], [38, 0, 16], [19, 6, 14]]) {
+      ctx.beginPath(); ctx.arc(x + dx * s, y + dy * s, r * s, 0, 7); ctx.fill();
+    }
+  }
+  // city
+  const base = GY - 24;
+  for (const [x, h] of BUILDINGS) {
+    ctx.fillStyle = '#a8dec8'; ctx.fillRect(x, base - h, 32, h + 24);
+    ctx.fillStyle = '#c4ecdc';
+    for (let wy = base - h + 8; wy < base - 4; wy += 14)
+      for (let wx = x + 5; wx < x + 28; wx += 11) ctx.fillRect(wx, wy, 5, 7);
+  }
+  // clouds
+  ctx.fillStyle = '#e4fbd6';
+  for (let x = -10; x < W + 30; x += 34) { ctx.beginPath(); ctx.arc(x, GY - 18, 22, 0, 7); ctx.fill(); }
+  // bushes
+  for (let x = -6; x < W + 20; x += 24) {
+    ctx.fillStyle = '#3cb54a'; ctx.beginPath(); ctx.arc(x, GY - 2, 14, Math.PI, 0); ctx.fill();
+    ctx.fillStyle = '#5fe06a'; ctx.beginPath(); ctx.arc(x - 2, GY - 4, 11, Math.PI, 0); ctx.fill();
+  }
+}
+
+function drawPipe(x, y, h, capY) {
+  // body
+  ctx.fillStyle = '#73bf2e'; ctx.fillRect(x, y, PIPE_W, h);
+  ctx.fillStyle = '#d6f27f'; ctx.fillRect(x + 3, y, 5, h);
+  ctx.fillStyle = '#558022'; ctx.fillRect(x + PIPE_W - 9, y, 9, h);
+  ctx.strokeStyle = OUTLINE; ctx.lineWidth = 2; ctx.strokeRect(x + 1, y, PIPE_W - 2, h);
+  // cap
+  const cx = x - 2, cw = PIPE_W + 4;
+  ctx.fillStyle = '#73bf2e'; ctx.fillRect(cx, capY, cw, CAP_H);
+  ctx.fillStyle = '#d6f27f'; ctx.fillRect(cx + 3, capY, 5, CAP_H);
+  ctx.fillStyle = '#558022'; ctx.fillRect(cx + cw - 9, capY, 9, CAP_H);
+  ctx.strokeRect(cx + 1, capY + 1, cw - 2, CAP_H - 2);
+}
+
+function drawGround() {
+  const off = scroll % 24;
+  ctx.fillStyle = '#ded895'; ctx.fillRect(0, GY, W, GROUND);
+  // green stripe band with diagonal stripes
+  ctx.fillStyle = '#73bf2e'; ctx.fillRect(0, GY + 4, W, 14);
+  ctx.fillStyle = '#9ce659';
+  for (let x = -24 - off; x < W + 24; x += 24) {
+    ctx.beginPath(); ctx.moveTo(x, GY + 18); ctx.lineTo(x + 12, GY + 18);
+    ctx.lineTo(x + 20, GY + 4); ctx.lineTo(x + 8, GY + 4); ctx.fill();
+  }
+  ctx.fillStyle = '#558022'; ctx.fillRect(0, GY + 18, W, 3);
+  ctx.fillStyle = '#d0a74c'; ctx.fillRect(0, GY + 21, W, 3);
+  ctx.fillStyle = OUTLINE; ctx.fillRect(0, GY, W, 4);
+}
+
+// 17x12 pixel-art bird; K outline, Y body, L highlight, O belly, W white, R/E beak
+const PAL = { K: OUTLINE, Y: '#f8d838', L: '#fff4a0', O: '#f8b838', W: '#fff', R: '#f85830', E: '#e8402a' };
+const BODY = [
+  '....KKKKKK.......',
+  '..KKLLLLYYKWWK...',
+  '.KLLLLYYYYKWWWWK.',
+  'KYYYYYYYYYKWWKWK.',
+  'KYYYYYYYYYKWWWWK.',
+  'KYYYYYYYYYYKKKKKK',
+  'KYYYYYYYYYKRRRRRK',
+  'KYYYYYYYYYKKKKKKK',
+  'KYYYYYYYYYKEEEEEK',
+  '.KOOOOOOOOKKKKKK.',
+  '..KKOOOOOOOK.....',
+  '....KKKKKKK......',
+];
+const WING = ['.KKKK.', 'KWWWWK', 'KWWWWK', '.KKKK.'];
+const BIRD_FRAMES = [4, 5, 7].map(wingRow => {
+  const c = document.createElement('canvas'); c.width = 17; c.height = 12;
+  const g = c.getContext('2d');
+  const put = (rows, ox, oy) => rows.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (PAL[ch]) { g.fillStyle = PAL[ch]; g.fillRect(ox + x, oy + y, 1, 1); }
+  }));
+  put(BODY, 0, 0); put(WING, 2, wingRow);
+  return c;
+});
+
+function drawBird() {
+  ctx.save();
+  ctx.translate(BIRD_X, bird.y);
+  ctx.rotate(Math.max(-0.45, Math.min(1.3, bird.v / 9)));
+  ctx.imageSmoothingEnabled = false;
+  const f = state === 'dead' ? 1 : Math.floor(frame / 4) % 3;
+  ctx.drawImage(BIRD_FRAMES[f], -17, -12, 34, 24); // 17x12 sprite at 2x
+  ctx.restore();
+}
+
+function outlinedText(s, x, y, size, fill) {
+  ctx.font = `bold ${size}px ${FONT}`; ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+  ctx.lineWidth = size / 4; ctx.strokeStyle = OUTLINE; ctx.strokeText(s, x, y);
+  ctx.fillStyle = fill; ctx.fillText(s, x, y);
+}
+
+function drawMeter() {
+  const x = W / 2 - 40, y = GY + 40;
+  ctx.fillStyle = OUTLINE; ctx.fillRect(x - 2, y - 2, 84, 12);
+  ctx.fillStyle = slowLocked ? '#888' : '#4a90ff'; ctx.fillRect(x, y, 80 * energy, 8);
+  outlinedText('S SLOW-MO', W / 2, y + 30, 12, '#fff');
+}
+
+function dim() { ctx.fillStyle = 'rgba(0,0,0,0.88)'; ctx.fillRect(0, 0, W, H); }
+
+function drawEntry() {
+  dim();
+  outlinedText('NEW HIGH SCORE', W / 2, 120, 26, '#f8a030');
+  outlinedText(score, W / 2, 180, 44, '#fff');
+  outlinedText('ENTER INITIALS', W / 2, 228, 18, '#fff');
+  for (let i = 0; i < 3; i++) {
+    const x = W / 2 + (i - 1) * 60, on = i === cur;
+    outlinedText(initials[i], x, 305, 52, on ? '#f8d838' : '#fff');
+    ctx.fillStyle = on ? '#f8d838' : '#888'; ctx.fillRect(x - 18, 316, 36, 4);
+  }
+  ctx.fillStyle = '#73bf2e'; ctx.fillRect(BTN.x, BTN.y, BTN.w, BTN.h);
+  ctx.strokeStyle = OUTLINE; ctx.lineWidth = 3; ctx.strokeRect(BTN.x, BTN.y, BTN.w, BTN.h);
+  outlinedText('OK', W / 2, BTN.y + 27, 22, '#fff');
+  ctx.fillStyle = '#ddd'; ctx.font = `12px ${FONT}`; ctx.textAlign = 'center';
+  ctx.fillText('Type or tap letters', W / 2, 425);
+  ctx.fillText('Enter / OK to save', W / 2, 445);
+}
+
+function drawBoard() {
+  dim();
+  outlinedText('TOP 10', W / 2, 70, 30, '#f8a030');
+  ctx.font = `bold 17px ${MONO}`;
+  for (let i = 0; i < 10; i++) {
+    const e = scores[i], y = 118 + i * 30;
+    ctx.fillStyle = e && e === newEntry ? '#f8d838' : e ? '#fff' : '#777';
+    ctx.textAlign = 'left';
+    ctx.fillText(`${String(i + 1).padStart(2, ' ')}.`, 44, y);
+    ctx.fillText(e ? e.name : '---', 100, y);
+    ctx.textAlign = 'right';
+    ctx.fillText(e ? e.score : '-', W - 44, y);
+  }
+  outlinedText(`YOUR SCORE ${score}`, W / 2, 440, 16, '#fff');
+  if (frame > 30 && Math.floor(frame / 30) % 2 === 1) outlinedText('Tap / Space', W / 2, 480, 18, '#fff');
+}
+
+function draw() {
+  drawBackground();
+  for (const p of pipes) {
+    drawPipe(p.x, 0, p.top - CAP_H, p.top - CAP_H);
+    drawPipe(p.x, p.top + GAP + CAP_H, GY - p.top - GAP - CAP_H, p.top + GAP);
+  }
+  drawGround();
+  drawBird();
+
+  if (state === 'play' && ts < 0.995) {
+    ctx.fillStyle = `rgba(90,130,255,${0.18 * (1 - ts) / (1 - SLOW)})`; ctx.fillRect(0, 0, W, GY);
+  }
+  if (state === 'play') { outlinedText(score, W / 2, 80, 42, '#fff'); drawMeter(); }
+  if (state === 'ready') {
+    outlinedText('Flappy Bird OG', W / 2, 90, 26, '#fff');
+    outlinedText('Get Ready', W / 2, 150, 34, '#f8a030');
+    outlinedText('Tap / Space', W / 2, 330, 18, '#fff');
+    outlinedText('Hold S / 2nd finger: slow-mo', W / 2, 360, 13, '#fff');
+  }
+  if (state === 'dead') outlinedText('Game Over', W / 2, 200, 38, '#f8a030');
+  if (state === 'entry') drawEntry();
+  if (state === 'board') drawBoard();
+}
+
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+addEventListener('keydown', e => {
+  if (state === 'entry') return entryKey(e);
+  if (e.code === 'Space') { e.preventDefault(); flap(); }
+  if (e.code === 'KeyS') slowHeld = true;
+});
+addEventListener('keyup', e => { if (e.code === 'KeyS') slowHeld = false; });
+addEventListener('blur', () => { slowHeld = false; });
+cv.addEventListener('pointerdown', e => {
+  e.preventDefault();
+  if (state === 'entry') return entryTap(e);
+  if (state === 'play' && downIds.size) { if (slowId === null) { slowId = e.pointerId; slowTouch = true; } }
+  else flap();
+  downIds.add(e.pointerId);
+});
+const pointerEnd = e => {
+  downIds.delete(e.pointerId);
+  if (e.pointerId === slowId) { slowId = null; slowTouch = false; }
+};
+addEventListener('pointerup', pointerEnd);
+addEventListener('pointercancel', pointerEnd);
+
+reset();
+loop();
+</script>
+</body>
+</html>
