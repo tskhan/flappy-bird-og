@@ -4,7 +4,15 @@ A browser clone of the original Flappy Bird, in a single HTML file. No build ste
 
 ## Run it
 
-Open `index.html` in any modern browser.
+Open `index.html` in any modern browser. Keep `scores.js` in the same folder: the game loads it for the high-score logic.
+
+## Tests
+
+```bash
+node --test
+```
+
+Runs `scores.test.js`, which covers the top-10 logic: sorting, the 10-entry limit, ties, who qualifies, and bad stored data.
 
 ## Controls
 
@@ -26,6 +34,10 @@ Open `index.html` in any modern browser.
 
 Scores are saved in the browser's `localStorage` under the key `flappyScores`. They stay on that browser and device only. Clearing site data erases them.
 
+## Timing
+
+The game steps at a fixed 60 times per second, so it plays the same on 30, 60 and 144 Hz screens.
+
 ## Tuning
 
 Game constants sit near the top of the script in `index.html`: `GRAVITY`, `FLAP`, `GAP`, `SPEED`, `SLOW`, `SLOW_DRAIN` and `SLOW_RECHARGE`.
@@ -33,3 +45,7 @@ Game constants sit near the top of the script in `index.html`: `GRAVITY`, `FLAP`
 ## Notes
 
 This is a fan project for learning. It copies the look and feel of the original, not its code or assets.
+
+## License
+
+MIT, see `LICENSE`.

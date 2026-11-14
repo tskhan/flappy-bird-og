@@ -11,6 +11,7 @@
 </head>
 <body>
 <canvas id="c" width="288" height="512"></canvas>
+<script src="scores.js"></script>
 <script>
 const cv = document.getElementById('c'), ctx = cv.getContext('2d');
 const W = cv.width, H = cv.height, GROUND = 112, GAP = 110, PIPE_W = 52, CAP_H = 26, SPEED = 2;
@@ -28,20 +29,16 @@ const SCORE_KEY = 'flappyScores', MONO = '"Courier New", monospace';
 const BTN = { x: W / 2 - 45, y: 350, w: 90, h: 38 };
 
 // ---- high scores (persisted in localStorage, top 10, sorted high to low) ----
+// (parseScores, qualifies, withScore come from scores.js)
 function loadScores() {
-  try {
-    const a = JSON.parse(localStorage.getItem(SCORE_KEY));
-    return (Array.isArray(a) ? a : [])
-      .filter(s => s && /^[A-Z]{3}$/.test(s.name) && Number.isFinite(s.score))
-      .sort((a, b) => b.score - a.score).slice(0, 10);
-  } catch { return []; }
+  try { return parseScores(localStorage.getItem(SCORE_KEY)); } catch { return null; } // null: storage unavailable
 }
-let scores = loadScores();
-const qualifies = s => s > 0 && (scores.length < 10 || s > scores[9].score);
+let scores = loadScores() ?? [];
 
 function addScore(name, s) {
+  scores = loadScores() ?? scores; // another tab may have saved since we loaded
   newEntry = { name, score: s };
-  scores = [...scores, newEntry].sort((a, b) => b.score - a.score).slice(0, 10);
+  scores = withScore(scores, newEntry);
   try { localStorage.setItem(SCORE_KEY, JSON.stringify(scores)); } catch {}
 }
 
@@ -54,6 +51,7 @@ function confirmEntry() {
 }
 
 function entryKey(e) {
+  if (e.ctrlKey || e.metaKey || e.altKey) return; // leave browser shortcuts (Ctrl+R etc.) alone
   const k = e.key;
   if (/^[a-z]$/i.test(k)) { initials[cur] = k.toUpperCase(); cur = Math.min(cur + 1, 2); }
   else if (k === 'Backspace' || k === 'ArrowLeft') cur = Math.max(cur - 1, 0);
@@ -117,12 +115,12 @@ function flap() {
 function update() {
   frame++;
   for (const c of clouds) { c.x -= c.s * 0.3; if (c.x < -50) c.x = W + 50; }
-  if (state === 'ready') { scroll += SPEED; bird.y =H / 2 - 40 + Math.sin(frame / 8) * 6; return; }
+  if (state === 'ready') { scroll += SPEED; bird.y = H / 2 - 40 + Math.sin(frame / 8) * 6; return; }
   if (state !== 'play') {
     bird.v += GRAVITY; bird.y = Math.min(bird.y + bird.v, GY - R);
     if (state === 'dead' && frame > 40) {
       cur = 0;
-      state = qualifies(score) ? 'entry' : 'board';
+      state = qualifies(scores, score) ? 'entry' : 'board';
       frame = 0;
     }
     return;
@@ -166,6 +164,26 @@ function die() {
 // ---- drawing ----
 const BUILDINGS = [[0,50],[34,80],[70,45],[100,95],[140,60],[176,85],[212,50],[244,75]]; // [x, height]
 
+// city, low clouds and bushes never change, so paint them once
+const SKYLINE = (() => {
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const base = GY - 24;
+  for (const [x, h] of BUILDINGS) {
+    g.fillStyle = '#a8dec8'; g.fillRect(x, base - h, 32, h + 24);
+    g.fillStyle = '#c4ecdc';
+    for (let wy = base - h + 8; wy < base - 4; wy += 14)
+      for (let wx = x + 5; wx < x + 28; wx += 11) g.fillRect(wx, wy, 5, 7);
+  }
+  g.fillStyle = '#e4fbd6';
+  for (let x = -10; x < W + 30; x += 34) { g.beginPath(); g.arc(x, GY - 18, 22, 0, 7); g.fill(); }
+  for (let x = -6; x < W + 20; x += 24) {
+    g.fillStyle = '#3cb54a'; g.beginPath(); g.arc(x, GY - 2, 14, Math.PI, 0); g.fill();
+    g.fillStyle = '#5fe06a'; g.beginPath(); g.arc(x - 2, GY - 4, 11, Math.PI, 0); g.fill();
+  }
+  return c;
+})();
+
 function drawBackground() {
   ctx.fillStyle = '#4ec0ca'; ctx.fillRect(0, 0, W, H);
   // sky clouds
@@ -175,22 +193,7 @@ function drawBackground() {
       ctx.beginPath(); ctx.arc(x + dx * s, y + dy * s, r * s, 0, 7); ctx.fill();
     }
   }
-  // city
-  const base = GY - 24;
-  for (const [x, h] of BUILDINGS) {
-    ctx.fillStyle = '#a8dec8'; ctx.fillRect(x, base - h, 32, h + 24);
-    ctx.fillStyle = '#c4ecdc';
-    for (let wy = base - h + 8; wy < base - 4; wy += 14)
-      for (let wx = x + 5; wx < x + 28; wx += 11) ctx.fillRect(wx, wy, 5, 7);
-  }
-  // clouds
-  ctx.fillStyle = '#e4fbd6';
-  for (let x = -10; x < W + 30; x += 34) { ctx.beginPath(); ctx.arc(x, GY - 18, 22, 0, 7); ctx.fill(); }
-  // bushes
-  for (let x = -6; x < W + 20; x += 24) {
-    ctx.fillStyle = '#3cb54a'; ctx.beginPath(); ctx.arc(x, GY - 2, 14, Math.PI, 0); ctx.fill();
-    ctx.fillStyle = '#5fe06a'; ctx.beginPath(); ctx.arc(x - 2, GY - 4, 11, Math.PI, 0); ctx.fill();
-  }
+  ctx.drawImage(SKYLINE, 0, 0);
 }
 
 function drawPipe(x, y, h, capY) {
@@ -333,10 +336,20 @@ function draw() {
   if (state === 'board') drawBoard();
 }
 
-function loop() { update(); draw(); requestAnimationFrame(loop); }
+// Fixed 60 steps per second, whatever the screen's refresh rate. Cap catch-up so a hidden tab doesn't burst.
+const STEP = 1000 / 60;
+let lastTime = 0, acc = 0;
+function loop(now) {
+  acc = Math.min(acc + (now - (lastTime || now)), STEP * 5);
+  lastTime = now;
+  while (acc > STEP - 1) { update(); acc -= STEP; } // -1ms slack stops 60 Hz jitter skipping a step
+  draw();
+  requestAnimationFrame(loop);
+}
 
 addEventListener('keydown', e => {
   if (state === 'entry') return entryKey(e);
+  if (e.repeat) return; // a held key must not auto-repeat flaps
   if (e.code === 'Space') { e.preventDefault(); flap(); }
   if (e.code === 'KeyS') slowHeld = true;
 });
@@ -344,8 +357,10 @@ addEventListener('keyup', e => { if (e.code === 'KeyS') slowHeld = false; });
 addEventListener('blur', () => { slowHeld = false; });
 cv.addEventListener('pointerdown', e => {
   e.preventDefault();
+  try { cv.setPointerCapture(e.pointerId); } catch {} // so the release always reaches us, even outside the window
   if (state === 'entry') return entryTap(e);
-  if (state === 'play' && downIds.size) { if (slowId === null) { slowId = e.pointerId; slowTouch = true; } }
+  // a held finger plus a new one = slow-mo; once slow-mo is held, every further touch flaps
+  if (state === 'play' && slowId === null && downIds.size) { slowId = e.pointerId; slowTouch = true; }
   else flap();
   downIds.add(e.pointerId);
 });
@@ -357,7 +372,7 @@ addEventListener('pointerup', pointerEnd);
 addEventListener('pointercancel', pointerEnd);
 
 reset();
-loop();
+requestAnimationFrame(loop);
 </script>
 </body>
 </html>
